@@ -68,7 +68,9 @@ def create_rag_chain():
     return chain
 
 
-def search_documents(query: str, top_k: int | None = None) -> list[Document]:
+def search_documents(
+    query: str, top_k: int | None = None,
+) -> list[tuple[Document, float]]:
     """벡터 스토어에서 유사 문서를 검색한다. (LLM 없이 검색만)
 
     Args:
@@ -76,11 +78,11 @@ def search_documents(query: str, top_k: int | None = None) -> list[Document]:
         top_k: 반환할 문서 수. None이면 설정값 사용.
 
     Returns:
-        유사도 순으로 정렬된 Document 리스트.
+        (Document, 유사도 점수) 튜플 리스트. 점수가 높을수록 유사.
     """
     vector_store = get_vector_store()
     k = top_k or settings.search_top_k
-    return vector_store.similarity_search(query, k=k)
+    return vector_store.similarity_search_with_relevance_scores(query, k=k)
 
 
 def query(question: str) -> dict:
@@ -92,8 +94,8 @@ def query(question: str) -> dict:
     Returns:
         {"answer": str, "sources": list[Document]}
     """
-    # 검색
-    sources = search_documents(question)
+    # 검색 (유사도 점수 포함)
+    search_results = search_documents(question)
 
     # 답변 생성
     chain = create_rag_chain()
@@ -101,5 +103,5 @@ def query(question: str) -> dict:
 
     return {
         "answer": answer,
-        "sources": sources,
+        "search_results": search_results,
     }

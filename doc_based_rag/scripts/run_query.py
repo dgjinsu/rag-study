@@ -41,16 +41,23 @@ def main() -> None:
         # 답변 출력
         console.print(Panel(Markdown(result["answer"]), title="답변", border_style="green"))
 
-        # 참고 문서 출처 출력
-        if result["sources"]:
-            console.print("\n[dim]참고 문서:[/dim]")
-            seen = set()
-            for doc in result["sources"]:
+        # 참고 문서 출처 + 유사도 점수 출력
+        if result["search_results"]:
+            console.print("\n[dim]참고 문서 (유사도):[/dim]")
+            for doc, score in result["search_results"]:
                 source = doc.metadata.get("source", "알 수 없음")
-                if source not in seen:
-                    seen.add(source)
-                    title = doc.metadata.get("title", "")
-                    console.print(f"  [dim]- {source}[/dim]" + (f" ({title})" if title else ""))
+                title = doc.metadata.get("title", "")
+                # 점수에 따라 색상 변경
+                if score >= 0.7:
+                    color = "green"
+                elif score >= 0.5:
+                    color = "yellow"
+                else:
+                    color = "red"
+                label = f"  [{color}]{score:.4f}[/{color}] {source}"
+                if title:
+                    label += f" ({title})"
+                console.print(label)
         console.print()
 
     console.print("\n[dim]종료합니다.[/dim]")
