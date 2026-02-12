@@ -1,29 +1,32 @@
 """임베딩 + ChromaDB 저장 모듈.
 
-Ollama에 비동기 동시 요청으로 임베딩을 병렬 처리하고,
+sentence-transformers로 로컬 임베딩을 수행하고,
 ChromaDB에 저장한다.
 """
 
-import asyncio
-
-import httpx
+import torch
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
-from langchain_ollama import OllamaEmbeddings
+from langchain_huggingface import HuggingFaceEmbeddings
+from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn
+from sentence_transformers import SentenceTransformer
 
 from src.config import settings
 
-# Ollama 서버에 동시에 보낼 수 있는 최대 요청 수
-# GPU 성능에 따라 조절 (높을수록 빠르지만 서버 부하 증가)
-MAX_CONCURRENCY = 20
+console = Console()
+
+# sentence-transformers encode() 시 배치 크기
+BATCH_SIZE = 64
+# GPU 사용 가능 여부 확인
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def get_embeddings() -> OllamaEmbeddings:
-    """Ollama 임베딩 모델을 반환한다."""
-    return OllamaEmbeddings(
-        model=settings.embedding_model,
-        base_url=settings.ollama_base_url,
+def get_embeddings() -> HuggingFaceEmbeddings:
+    """HuggingFace 임베딩 모델을 반환한다. (LangChain 호환)"""
+    return HuggingFaceEmbeddings(
+        model_name=settings.embedding_model,
+        model_kwargs={"device": DEVICE},
     )
 
 
@@ -36,83 +39,52 @@ def get_vector_store() -> Chroma:
     )
 
 
-async def _embed_all(texts: list[str], progress, task) -> list[list[float]]:
-    """모든 텍스트를 동시에 임베딩한다.
+def _embed_all(texts: list[str], progress, task) -> list[list[float]]:
+    """sentence-transformers로 모든 텍스트를 임베딩한다.
 
-    asyncio.gather로 모든 요청을 동시에 실행하되,
-    Semaphore로 동시 실행 수를 MAX_CONCURRENCY로 제한한다.
-
-    예: 528개 청크, MAX_CONCURRENCY=10이면
-        → 10개씩 동시 요청, 나머지는 자리가 날 때까지 대기
-        → 순차 처리 대비 최대 10배 빨라짐
+    GPU가 있으면 자동으로 GPU를 사용하고,
+    내부적으로 배치 처리하여 메모리를 효율적으로 관리한다.
     """
-    # Semaphore: 동시에 실행할 수 있는 코루틴 수를 제한하는 잠금 장치
-    # acquire()하면 카운트 -1, release()하면 +1, 0이면 대기
-    semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
+    model = SentenceTransformer(settings.embedding_model, device=DEVICE)
+    console.print(f"  디바이스: [bold]{DEVICE.upper()}[/bold]")
 
-    # 결과를 인덱스 순서대로 저장할 리스트 (gather는 완료 순서가 보장되지 않으므로)
-    results: list[list[float]] = [[] for _ in texts]
+    all_embeddings = []
+    # 배치 단위로 나눠서 진행 바를 업데이트
+    for i in range(0, len(texts), BATCH_SIZE):
+        batch = texts[i : i + BATCH_SIZE]
+        batch_embeddings = model.encode(batch, show_progress_bar=False)
+        all_embeddings.extend(batch_embeddings.tolist())
+        progress.advance(task, len(batch))
 
-    async with httpx.AsyncClient() as client:
-
-        async def _request(i: int, text: str):
-            async with semaphore:
-                try:
-                    resp = await client.post(
-                        f"{settings.ollama_base_url}/api/embed",
-                        json={"model": settings.embedding_model, "input": text},
-                        timeout=120.0,
-                    )
-                    resp.raise_for_status()
-                    results[i] = resp.json()["embeddings"][0]
-                except httpx.HTTPStatusError:
-                    # 텍스트가 너무 길면 앞부분만 잘라서 재시도
-                    truncated = text[:500]
-                    resp = await client.post(
-                        f"{settings.ollama_base_url}/api/embed",
-                        json={"model": settings.embedding_model, "input": truncated},
-                        timeout=120.0,
-                    )
-                    resp.raise_for_status()
-                    results[i] = resp.json()["embeddings"][0]
-                progress.advance(task)
-
-        # 모든 텍스트에 대한 코루틴을 한번에 생성하고 동시 실행
-        # gather는 모든 코루틴이 완료될 때까지 대기
-        await asyncio.gather(*[_request(i, t) for i, t in enumerate(texts)])
-
-    return results
+    return all_embeddings
 
 
 def index_documents(chunks: list[Document]) -> Chroma:
-    """청크 리스트를 병렬 임베딩하여 ChromaDB에 저장한다."""
+    """청크 리스트를 임베딩하여 ChromaDB에 저장한다."""
     texts = [c.page_content for c in chunks]
     metadatas = [c.metadata for c in chunks]
 
-    # rich Progress: 터미널에 진행 바를 표시
     with Progress(
-        SpinnerColumn(),          # ⠋ 회전 애니메이션
-        TextColumn("[bold blue]{task.description}"),  # "임베딩 중..."
-        BarColumn(),              # 진행 바
-        TextColumn("{task.completed}/{task.total}"),   # 350/528
-        TimeElapsedColumn(),      # 0:01:23 경과 시간
+        SpinnerColumn(),
+        TextColumn("[bold blue]{task.description}"),
+        BarColumn(),
+        TextColumn("{task.completed}/{task.total}"),
+        TimeElapsedColumn(),
     ) as progress:
         task = progress.add_task("임베딩 중...", total=len(chunks))
-        # 비동기 함수를 동기 컨텍스트에서 실행
-        embeddings = asyncio.run(_embed_all(texts, progress, task))
+        embeddings = _embed_all(texts, progress, task)
 
-    # 임베딩 완료 후 ChromaDB에 저장
+    # ChromaDB에 저장
     vector_store = Chroma(
         collection_name=settings.chroma_collection,
         embedding_function=get_embeddings(),
         persist_directory=settings.chroma_persist_dir,
     )
-    # upsert: 같은 id가 있으면 덮어쓰기, 없으면 새로 추가
     vector_store._collection.upsert(
         ids=[f"chunk_{i}" for i in range(len(chunks))],
-        documents=texts,        # 원문 텍스트 (검색 결과에서 보여줄 용도)
-        embeddings=embeddings,  # 벡터 (유사도 검색에 사용)
-        metadatas=metadatas,    # 메타데이터 (source, title, header 등)
+        documents=texts,
+        embeddings=embeddings,
+        metadatas=metadatas,
     )
 
     return vector_store
